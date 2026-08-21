@@ -1,0 +1,12 @@
+# Ignore everything by default
+*
+
+# But do not ignore directories (so git can recurse into them to find tracked files)
+!*/
+
+# Do not ignore Python files anywhere
+!**/*.py
+!*.py
+
+# Keep this .gitignore tracked
+!.gitignore
