@@ -40,7 +40,7 @@ import concurrent.futures
 import threading
 from typing import Dict, Set, Optional, List
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# Logger setup is moved into main() to support dynamic logging configuration via CLI arguments.
 log = logging.getLogger("monitor_disks")
 
 # Helpers
@@ -66,7 +66,32 @@ def human_to_bytes(s: str) -> int:
     return int(s)
 
 
-def probe_block_devices() -> Dict[str, dict]:
+def load_processed_serials() -> Set[str]:
+    """Load the set of SMART serial numbers already provisioned from a persistent JSON file."""
+    history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_disks_history.json")
+    if not os.path.exists(history_file):
+        return set()
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data if isinstance(data, list) else [])
+    except Exception as e:
+        log.error("Failed to load processed serials from %s: %s", history_file, e)
+        return set()
+
+def save_processed_serial(serial: str):
+    """Persist a SMART serial number into the JSON file."""
+    history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_disks_history.json")
+    try:
+        current_serials = list(load_processed_serials())
+        if serial not in current_serials:
+            current_serials.append(serial)
+            with open(history_file, "w", encoding="utf-8") as f:
+                json.dump(sorted(current_serials), f)
+    except Exception as e:
+        log.error("Failed to save serial %s to history: %s", serial, e)
+
+
     """Return a dict of kname -> device info for top-level block devices (type == disk)."""
     try:
         # Include mountpoint and fstype so we can detect mounted partitions and filesystems
@@ -432,7 +457,16 @@ def handle_new_disk(kname: str, devinfo: dict, threshold_bytes: int, do_force: b
     if size < threshold_bytes:
         log.info("[%s] Disk is below threshold (%d bytes); skipping", prefix, threshold_bytes)
         return
+
+    # Retrieve identity for persistence and safety checks
+    serial = get_smart_serial(device)
+    processed_serials = load_processed_serials()
+    if serial and serial in processed_serials:
+        log.info("[%s] Disk with Serial %s has already been provisioned successfully in a previous session. Skipping.", prefix, serial)
+        return
+
     dry_run = not do_force
+...
     log.info("[%s] Disk exceeds threshold (%d bytes). dry_run=%s", prefix, threshold_bytes, dry_run)
 
     # Identity verification using /dev/disk/by-id
@@ -512,16 +546,42 @@ def main():
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default 5)")
     parser.add_argument("--force", action="store_true", help="Perform destructive actions (wiping and repartitioning). Without this flag the script runs in dry-run mode")
     parser.add_argument("--concurrency", type=int, default=1, help="Number of disks to process concurrently (default 1 = sequential)")
-    parser.add_argument("--alarm", action="store_true", help="Play an alert sound when each disk finishes processing")
+            parser.add_argument("--logfile", default="./monitor_disks.log", help="Path to the log file.")
     parser.add_argument("--zfs-action", choices=["skip","clear"], default="skip",
                         help="How to handle disks with existing ZFS labels: skip (default) or clear (destructive)")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
+    # Handle logfile path logic early - ensure it's absolute based on script location if not provided
+    if args.logfile == "./monitor_disks.log":
+        script_root = os.path.dirname(os.path.abspath(__file__))
+        args.logfile = os.path.join(script_root, "monitor_disks.log")
+
+
+    # Configure logging based on CLI arguments
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError("Invalid log level")
-    logging.getLogger().setLevel(numeric_level)
+
+    # Initialize the logger with a file handler and stream handler to see it in both terminal AND file
+    logger = logging.getLogger()
+    logger.setLevel(numeric_level)
+    
+    # Clear existing handlers if any were added by default (though we shouldn't have them yet since we haven't called basicConfig)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+
+    # File handler
+    fh = logging.FileHandler(args.logfile)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    # Stream handler (stdout)
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
 
     # Interactive numeric menu for quick selection when running in a terminal.
     def ask_number(prompt: str, default: str) -> str:
